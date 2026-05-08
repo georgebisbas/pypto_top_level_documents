@@ -210,6 +210,21 @@ rank_id = ((i0 * rank_shape[1] + i1) * rank_shape[2] + i2) * ... + i_{D-1}
 
 Any other linearization (column-major, or a chosen permutation of axes) is admissible **as long as it is fixed and documented**, because compiler, runtime, and any debugging / verification tooling all need to agree on the same mapping. The choice is local to this design and does not change `sharded_tensor`'s user-facing API: users always supply `rank_index`; the linearization is internal.
 
+### 3.5 Optional: Topology Metadata via `rank_level` (Experimental)
+
+A `rank_shape` alone does not encode **where** each rank is located in a multi-node cluster hierarchy. An optional `rank_level` tuple specifies the Linqu level at which each axis is distributed, enabling topology-aware collectives and compiler hints:
+
+```python
+ST = pl.sharded_tensor(
+    shape=(M, N),
+    shard_shape=(M // 2, N // 4),
+    rank_shape=(2, 4),
+    rank_level=(4, 5),  # Axis-0: within-pod (L4), Axis-1: cross-supernode (L5)
+)
+```
+
+If omitted, topology is unknown and the runtime uses conservative defaults. See [sharded_tensor_topology_design.md](sharded_tensor_topology_design.md) for full design, framework comparisons, and implementation roadmap in simpler runtime. This extension is **experimental** and requires design team approval for promotion to a standard feature.
+
 ## 4. Inheritance and API surface (design sketch)
 
 - **Type relationship:** `sharded_tensor` is a **subtype** (derivative class) of `tensor` in the type system, with **additional** constraints and **additional** metadata: the **per-rank** `shard_shape`, the **rank-grid** `rank_shape` (multi-dimensional), the local rank's own `rank_index` (a vector identifying this process within the grid), the derived `rank_num == prod(rank_shape)` and `rank_id` (flat id from `rank_index`), and a reference to the symmetric shared-memory handle as required by `open_share_memory`.
@@ -343,28 +358,45 @@ After a `sharded_tensor` is **defined** at this rank (its local slice has been c
 
 **Where the sync sits relative to the ring buffer.** The local **slot** is allocated **before** the sync (so each rank has something to publish). The slot's **lifetime** in the ring is governed by the ordinary scope/ring rules; the sync only governs **when the global tensor object is observably ready**. Equivalently: the ring has the storage, and the sync converts it from "private byte region at rank i" to "byte region i of a globally addressable sharded tensor".
 
-### 6.3 Retirement: collective vs unilateral (this is genuinely worth deciding now)
+### 6.3 Retirement: scope-epoch bulk reclamation (recommended default)
 
-**The simplest model** is symmetric: just as construction is global, **retirement is also a global synchronization** — every rank reaches the end-of-life point for the `sharded_tensor` (scope exit, explicit `pl.free`, or equivalent), participates in a barrier, and **all ranks free their share at the same logical instant**. After the barrier, no rank may legally reference the tensor any longer. This mirrors the construction step and gives the cleanest invariant:
+**The correctness goal** is unchanged: no rank may legally dereference any part of a `sharded_tensor`'s symmetric region after retirement, and no rank's local share may be reclaimed while another rank's remote access to that share is still in flight. The question is how to achieve this goal efficiently.
 
-> **A `sharded_tensor` is either fully alive at every rank, or fully dead at every rank.**
+#### 6.3.1 Why per-tensor collective retirement is the wrong default at scale
 
-**However, the question of whether retirement truly needs a global sync deserves explicit review.** A blocking global retirement is not free, and adding it indiscriminately can complicate error handling. We list both directions for the team to choose.
+The naïve symmetric approach — mirror construction by issuing a global blocking barrier at each individual `sharded_tensor`'s end-of-life — is correct in isolation but fails to compose at training or inference scale:
 
-**Arguments for keeping retirement collective (default in this design):**
+- **Barrier count scales with object count, not step count.** A transformer model with many layers, trained with ZeRO-3 or FSDP, creates and frees O(hundreds) of weight and activation shards per forward + backward pass. Per-tensor collective retirement adds O(hundreds) of global barriers to the critical path of every training step — independently of cluster size.
+- **Cost grows with `rank_num`.** At 1000 ranks, even an efficient all-ranks barrier adds tens to hundreds of microseconds per synchronization event. The per-step barrier budget is consumed by retirement overhead, not by computation.
+- **Fault tolerance interaction.** If any rank aborts (OOM, NaN guard, device error) between construction and retirement, surviving ranks block forever waiting for a barrier the failed rank will never enter. At large cluster sizes this scenario occurs multiple times per hour on real hardware. Per-tensor collective retirement converts a single-rank failure into a distributed deadlock of the entire job.
 
-- **Symmetry with construction.** Construction is collective and blocking; retirement being collective makes the lifetime model uniform and easy to teach.
-- **No "use-after-free across ranks" race.** If rank A keeps the tensor alive for one more access while rank B has already torn down its share, A's remote access through the symmetric-memory contract would target dead memory. A collective barrier removes this hazard by construction.
-- **Simple reclamation of the symmetric region.** The open-share-memory handle and the per-rank slot can be reclaimed as a single coordinated event, without requiring a per-rank "is anyone else still using my share?" protocol.
-- **Easier reasoning for the runtime / tensormap.** Lifetime is a single global event, not a per-rank distributed garbage collection.
+All major distributed training systems — Megatron-LM, DeepSpeed, FSDP2, OpenSHMEM-based runtimes — handle this by **amortizing** synchronization: tensors are freed in coordinated batches at epoch boundaries (end of micro-batch, end of pipeline stage, end of optimizer step), not individually.
 
-**Arguments against / cases where it is overkill (worth thinking through):**
+#### 6.3.2 Recommended default: scope-epoch bulk retirement
 
-- **Cost on the critical path.** A blocking global barrier at every retirement, when many `sharded_tensor`s are short-lived and locally-only consumed, is potentially expensive.
-- **Error handling complexity.** If one rank fails between construction and retirement (e.g. throws, aborts, or hits a device error), a collective retirement barrier becomes a **distributed cleanup** problem: surviving ranks may block forever waiting for a barrier the failed rank will never enter. Solving this **correctly** typically requires timeouts, fault-tolerant barriers, fencing, or an explicit "kill the whole symmetric region on any rank's failure" policy. Avoiding the collective retirement also avoids needing to specify all of that.
-- **Locally-only access patterns.** If a `sharded_tensor` is **provably** never accessed remotely after a certain program point (e.g. a write-once, locally-read tensor), retirement could in principle be local — but proving "no rank will reach across" in the general case is hard.
+The recommended default is **scope-epoch bulk retirement**: all `sharded_tensor`s allocated within a given scope are retired together when that scope exits. The retirement sequence is:
 
-**Recommended position for review (not a final decision).** Adopt **collective, blocking retirement** as the default — its symmetry with construction is the largest source of correctness simplification — but **explicitly track error handling** in the design (Section 9) so the team knows the cost. If profiling later shows the global retirement is hot, a follow-up extension can introduce an opt-in "local retirement" mode for tensors with statically-proved no remote access.
+1. **All remote accesses into this scope's sharded tensors complete** (the issuing rank drains any in-flight async requests against those symmetric regions).
+2. **A single scope-exit barrier fires** — one all-ranks barrier per scope exit, not one per tensor. The barrier provides the same "no rank may be referencing any share from this scope" invariant as per-tensor retirement, but amortized across all `sharded_tensor`s in the scope.
+3. **All local shares from this scope are returned to the ring buffer** in lockstep, the same way the ring-buffer model today reclaims ordinary tensors at scope depth `d`.
+
+This is the natural integration with pypto's existing scope + ring-buffer lifetime model (§6.1): the scope is already the granularity at which the ring reclaims storage; `sharded_tensor` retirement simply adds a single barrier at the scope exit event that already exists.
+
+> **A scope's worth of `sharded_tensor`s are either all alive or all retired — the invariant holds at scope granularity, not per-object.**
+
+The correctness argument is identical to per-tensor retirement: no rank may access a symmetric region after the scope-exit barrier returns. The performance argument is categorical: one barrier per scope exit vs. one barrier per tensor.
+
+#### 6.3.3 Per-tensor explicit retirement as an opt-in
+
+For tensors with **cross-scope lifetime** (e.g. a model weight shard that outlives the micro-batch scope), the user may opt into explicit retirement via `pl.free(ST)`, which issues a per-tensor collective barrier on demand. This is the exception, not the default. The compiler may statically detect cases where `pl.free` is called before scope exit and validate that no remote accesses follow it.
+
+#### 6.3.4 Error handling model
+
+Scope-epoch retirement also simplifies fault handling: a rank failure at any point during a scope can be handled by aborting the scope on all ranks together (one fault-aware scope-exit), rather than requiring a fault-tolerant barrier at every individual tensor retirement event. The fault policy for scope-level abort is tracked in Open Question 7 (§9).
+
+#### 6.3.5 Why the symmetry argument for per-tensor retirement is not compelling
+
+Construction must be per-tensor and blocking because **access to any byte of any share is illegal until every rank has published its region**. Retirement does not have an equivalent forcing constraint: once a rank drains its in-flight remote accesses, its share can be reclaimed without requiring every other rank to have finished with its own share at the same instant. The correctness invariant is about access quiescence, not simultaneous freeing. Scope-epoch retirement achieves quiescence at the correct granularity with one barrier rather than N.
 
 ### 6.4 Mechanism summary
 
@@ -373,7 +405,7 @@ After a `sharded_tensor` is **defined** at this rank (its local slice has been c
 | Allocate | Carve the local slab of shape `shard_shape` (= **1 / rank_num** of global bytes) from the scope's ring buffer at the current scope depth `d`; build local metadata (`shape`, `tile_shape`, `shard_shape`, `rank_shape`, `self_rank_index`, `rank_id`, `rank_num`, open-share-memory handle). | None yet. |
 | Open share memory join | Publish the local share via the `open_share_memory` API. | **All-to-all global barrier** across all `prod(rank_shape) == rank_num` ranks: every rank reports "my share is ready" and waits. **Blocking**; on return, the sharded tensor is **fully ready globally**. |
 | Use | Own-share access uses **normal tensor codegen** on a tensor of shape `shard_shape` (no `rank_index` needed in the surface API). Remote access (`rank_index != self_rank_index`) uses, in the **preferred UB embodiment**, **direct load/store or `TLOAD` / `TSTORE` against the `ubmem import`-mapped base address** for the rank at that grid position; otherwise, **synchronous or asynchronous `open_share_memory` API calls**. | None per access (any cross-rank ordering is a regular memory-model concern, not part of construction). |
-| Retire | Drop scope token / `ref_count` reaches the retirement condition; release the local slot back to the ring. | **Collective barrier (default)**: every rank in the grid reaches retirement; after the barrier, the symmetric region's local share is reclaimed on every rank in lockstep. |
+| Retire | Scope exit drains any in-flight remote accesses into this scope's sharded tensors; local slot is returned to the ring buffer. | **Single scope-exit barrier (default)**: one all-ranks barrier per scope exit, amortized across all `sharded_tensor`s in the scope. After the barrier, every rank's local shares from this scope are reclaimed in lockstep. Per-tensor explicit retirement (`pl.free(ST)`) is available as an opt-in for cross-scope-lifetime tensors. |
 
 ## 7. Coexistence with normal and tile-consecutive tensors (programming paradigm)
 
@@ -442,6 +474,8 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
    - **Interaction with the construction / retirement barriers of §6.** Whether each collective is itself a synchronization point, and whether multiple collectives over the same `sharded_tensor` need any extra fencing beyond what the construction barrier already provides.
    - **Implementation backing.** Whether v1 implements collectives over the §5.3 / §5.3.1 direct-access path, over a conventional collective library, or both with a runtime-selectable backend.
 
+11. **Topology-aware collective selection via optional `rank_level` metadata (P1 priority).** Section 3.5 proposes an optional `rank_level` tuple for multi-node topology awareness. Before promotion from experimental, the team should decide: (a) whether `rank_level` ships in v1 or is deferred, (b) how the runtime queries `rank_level` to select topology-optimal collective algorithms (ring for intra-pod, tree for cross-pod), (c) which Linqu levels are canonical and required (recommend L4, L5, L6), and (d) how the compiler uses `rank_level` for direct-access lowering hints (§5.3.1) and transport decisions. See [sharded_tensor_topology_design.md](sharded_tensor_topology_design.md) for full framework analysis and simpler runtime integration roadmap.
+
 ## Summary
 
 | Concept | Description |
@@ -453,7 +487,7 @@ The simpler runtime is the natural home for `sharded_tensor`'s underlying mechan
 | `shape` / `tile_shape` / `shard_shape` / `rank_shape` | Global logical shape, optional physical tile shape, **per-rank** slab shape, and **rank-grid** shape (together: `shape == shard_shape ⊙ rank_shape`, element-wise product). |
 | Allocation | Same as a normal `tensor`: local variable of an orchestrator / incore function; placed in the **scope ring buffer** at the relevant scope depth. |
 | Construction sync | After local setup, invoke `open_share_memory` API; **global all-to-all blocking barrier** across all `prod(rank_shape) == rank_num` ranks; tensor becomes **fully ready globally** only after the barrier returns. |
-| Retirement sync | Default: **collective, blocking** global barrier so every rank releases its share at the same logical instant — under explicit review (Section 6.3 / Q6) for cost and error-handling complexity. |
+| Retirement sync | Default: **scope-epoch bulk retirement** — one all-ranks barrier at scope exit, amortized across all `sharded_tensor`s in the scope (§6.3). Per-tensor explicit retirement (`pl.free(ST)`) available as an opt-in for cross-scope-lifetime tensors. See Open Question 6 (§9) for fault-handling policy at scope abort. |
 | Access semantics | Extraction / layout ops (`view`, `reshape`, `slice`, …) take a **`rank_index`** **vector** argument and operate on **one rank's slice at a time**. **`rank_index` may be omitted for own-share access** (defaults to `self_rank_index`) — the local slice is then handled as a **normal `tensor`** of shape `shard_shape`. |
 | Lowering | Local case: normal tensor codegen. Remote case: in the **preferred UB embodiment**, direct CPU load/store or MTE `TLOAD` / `TSTORE` against the **`ubmem import`-mapped** local base address of the target rank (set up at construction time); fallback on non-UB platforms is **synchronous or asynchronous `open_share_memory` API calls**. |
 | Coexistence | Normal `tensor`s and **tile-consecutive** `tensor`s remain definable / allocatable at **every** layer of the pypto runtime hierarchy; they are local-only and cannot be shared across nodes. |
